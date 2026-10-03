@@ -186,6 +186,10 @@ class GatewayTurnMixin:
         # notice must never attach to another session's next turn (#74349).
         self._pre_agent_fallback_notice = None
 
+        from gateway.session_model_route import resolve_pinned_runtime
+        pinned = resolve_pinned_runtime(self, skey)
+        if pinned is not None:
+            return pinned
         model = _resolve_gateway_model(user_config)
         if skey:
             self._rehydrate_session_model_override(skey)
@@ -2163,6 +2167,8 @@ class GatewayTurnMixin:
         history, message_text = prepared.history, prepared.message_text
 
         try:
+            from gateway.session_model_route import prepare_route
+            await prepare_route(self, event, source, session_entry, history, message_text)
             hook_ctx = {
                 "platform": source.platform.value if source.platform else "",
                 "user_id": source.user_id,
@@ -2225,6 +2231,8 @@ class GatewayTurnMixin:
                     event._notification_reply_muted = agent_result["_notification_reply_muted"]
 
             await self._hmwa_stop_typing_for_turn(event, source)
+            if agent_result.get("native_model_route_notice") and not event.internal:
+                await self._deliver_platform_notice(source, agent_result["native_model_route_notice"])
 
             if not self._is_session_run_current(_quick_key, run_generation):
                 self._hmwa_discard_stale_result(source, _quick_key, run_generation)
@@ -2264,6 +2272,9 @@ class GatewayTurnMixin:
             )
 
         except Exception as e:
+            from gateway.session_model_route import SessionModelRouteError
+            if isinstance(e, SessionModelRouteError):
+                return str(e)
             return await self._hmwa_agent_error_reply(e, event, source, session_entry, session_key, prepared)
         finally:
             # Restore session context variables to their pre-handler state

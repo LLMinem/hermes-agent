@@ -1104,15 +1104,17 @@ class SessionStore(
 
         with self._lock:
             entry = self._entry_locked(session_key)
-            if entry is None or entry.model_override == cleaned:
+            if entry is None or (entry.model_override == cleaned and "native_model_route" not in entry.metadata):
                 return
             # Publish only after persistence so a failed clear remains retryable.
             data, generation = self._snapshot_routing_locked()
             # Snapshot reconciliation may replace the entry after database recovery.
             entry = self._entries[session_key]
-            data[session_key] = replace(entry, model_override=cleaned).to_dict()
+            metadata = {k: v for k, v in entry.metadata.items() if k != "native_model_route"}
+            data[session_key] = replace(entry, model_override=cleaned, metadata=metadata).to_dict()
             self._persist_routing_data(data, generation)
             entry.model_override = cleaned
+            entry.metadata = metadata
 
     def get_model_override(self, session_key: str) -> Optional[Dict[str, str]]:
         """Return the persisted /model override for *session_key*, if any."""
@@ -1260,6 +1262,8 @@ class SessionStore(
             new_entry = self._replace_route_locked(
                 session_key, old_entry, target_session_id, _now(),
                 display_name=old_entry.display_name, model_override=old_entry.model_override,
+                metadata=({"native_model_route": dict(old_entry.metadata["native_model_route"])}
+                          if "native_model_route" in old_entry.metadata else {}),
                 prompt_pin=(
                     dict(old_entry.prompt_pin)
                     if preserve_prompt_pin and old_entry.prompt_pin is not None else None
