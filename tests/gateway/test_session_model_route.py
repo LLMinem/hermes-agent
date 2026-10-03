@@ -7,7 +7,7 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform
 from gateway.session import SessionSource, SessionStore
-from gateway.session_model_route import META_KEY, prepare_route, persist_route, read_route, SessionModelRouteError
+from gateway.session_model_route import META_KEY, prepare_route, read_route, SessionModelRouteError
 from agent.session_model_pin import SessionModelPin
 
 SOL = "gpt-6.1-sol"
@@ -25,7 +25,7 @@ def setup(tmp_path, monkeypatch):
     monkeypatch.setattr(run, "_resolve_gateway_model", lambda *_a, **_kw: SOL)
     monkeypatch.setattr(run, "_resolve_runtime_agent_kwargs", lambda: {"provider": PROVIDER, "api_key": "test", "api_mode": "codex_responses"})
     monkeypatch.setattr(run, "_resolve_runtime_agent_kwargs_for_provider", lambda provider, **kw: {"provider": provider, "api_key": "test", "api_mode": "codex_responses"})
-    monkeypatch.setattr("hermes_cli.plugins.has_middleware", lambda kind: kind == "session_model_route")
+    monkeypatch.setattr("hermes_cli.plugins.has_middleware", lambda kind, **kw: kind == "session_model_route")
     classifier = Mock(return_value=[{"route": {"model": ASTRA, "provider": PROVIDER}}])
     monkeypatch.setattr("hermes_cli.plugins.invoke_middleware", classifier)
     yield runner, source, entry, classifier
@@ -46,7 +46,7 @@ async def test_native_route_survives_followup_restart_and_plugin_loss(setup, mon
     restarted = SessionStore(sessions_dir=runner.session_store.sessions_dir, config=GatewayConfig())
     runner.session_store = restarted
     runner._session_state(entry.session_key).conversation.model_override = None
-    monkeypatch.setattr("hermes_cli.plugins.has_middleware", lambda _: False)
+    monkeypatch.setattr("hermes_cli.plugins.has_middleware", lambda _, **kw: False)
     await prepare_route(runner, event, source, restarted.get_or_create_session(source), [], "retry after restart")
     assert runner._resolve_session_agent_runtime(source=source, session_key=entry.session_key)[0] == ASTRA
     assert classifier.call_count == 1
@@ -180,8 +180,8 @@ async def test_bad_routing_store_blocks_rather_than_reclassifies(setup):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("wire_drift", [False, True])
-async def test_real_native_agent_constructor_and_codex_tool_loop(setup, monkeypatch, wire_drift):
+@pytest.mark.parametrize("fault", ["none", "wire_drift", "middleware_exception", "provider_failure"])
+async def test_real_native_agent_constructor_and_codex_tool_loop(setup, monkeypatch, fault):
     from run_agent import AIAgent
     from gateway.run_turn_runner import TurnRunner
     from tests.agent.test_run_agent_codex_responses import (
@@ -202,7 +202,11 @@ async def test_real_native_agent_constructor_and_codex_tool_loop(setup, monkeypa
     assert agent.model == ASTRA
     assert agent.provider == PROVIDER
     assert agent.api_mode == "codex_responses"
-    agent._session_model_pin = SessionModelPin(model, PROVIDER)
+    from gateway.session_model_route import bind_agent
+    runner._apply_fallback_chain_to_agent(agent, [{"provider": PROVIDER, "model": SOL}])
+    assert agent._fallback_chain
+    bind_agent(runner, entry.session_key, agent)
+    assert not agent._fallback_chain
     agent._disable_streaming = True
     responses = [_codex_tool_call_response(), _codex_message_response("done"), _codex_message_response("again")]
     for response in responses:
@@ -210,19 +214,36 @@ async def test_real_native_agent_constructor_and_codex_tool_loop(setup, monkeypa
     requests = []
     def fake_provider(kwargs):
         requests.append(kwargs)
+        if fault == "provider_failure":
+            raise RuntimeError("synthetic provider failure")
         return responses.pop(0)
     monkeypatch.setattr(agent, "_interruptible_api_call", fake_provider)
     def tool_reply(message, messages, *_args):
         messages.extend({"role": "tool", "tool_call_id": c.id, "content": "synthetic tool result"}
                         for c in message.tool_calls)
     monkeypatch.setattr(agent, "_execute_tool_calls", tool_reply)
-    if wire_drift:
+    if fault == "wire_drift":
         monkeypatch.setattr("agent.retry_utils.jittered_backoff", lambda *a, **kw: 0)
         def rewrite(request, **kw):
             return SimpleNamespace(payload={**request, "model": SOL}, original_payload=request, trace=[])
         monkeypatch.setattr("hermes_cli.middleware.apply_llm_request_middleware", rewrite)
+    monkeypatch.setattr("agent.retry_utils.jittered_backoff", lambda *a, **kw: 0)
+    if fault == "middleware_exception":
+        from hermes_cli.plugins import PluginManager, PluginContext, PluginManifest
+        manager = PluginManager()
+        ctx = PluginContext(PluginManifest(name="synthetic-thrower"), manager)
+        def broken(**kwargs):
+            raise RuntimeError("synthetic request middleware failure")
+        ctx.register_middleware("llm_request", broken)
+        monkeypatch.setattr("hermes_cli.plugins.has_middleware", manager.has_middleware)
+        monkeypatch.setattr("hermes_cli.plugins.invoke_middleware", manager.invoke_middleware)
     first = agent.run_conversation("synthetic command")
-    if wire_drift:
+    if fault == "provider_failure":
+        assert first.get("failed") is True
+        assert requests and all(request["model"] == ASTRA for request in requests)
+        assert agent.model == ASTRA
+        return
+    if fault == "wire_drift":
         assert requests == []
         assert first.get("failed") is True
         return
@@ -234,3 +255,23 @@ async def test_real_native_agent_constructor_and_codex_tool_loop(setup, monkeypa
     assert "Confirmed by provider" in agent._session_model_pin.receipt()
     assert classifier.call_count == 1
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("temporary", [SOL, ASTRA])
+async def test_native_pin_resumes_after_manual_once_including_same_model(setup, temporary):
+    runner, source, entry, classifier = setup
+    await prepare_route(runner, SimpleNamespace(internal=False), source, entry, [], "Astra")
+    runner._resolve_session_agent_runtime(session_key=entry.session_key)
+    previous = runner._session_state(entry.session_key).conversation.model_override.copy()
+    result = SimpleNamespace(new_model=temporary, target_provider=PROVIDER, provider_label=PROVIDER,
+        api_key="synthetic", base_url="", api_mode="codex_responses", request_overrides={}, runtime_capabilities={})
+    context = SimpleNamespace(session_key=entry.session_key, current_model=ASTRA, persist_global=False,
+        restore_snapshot={"had_override": True, "override": previous})
+    await runner._record_model_switch(result, context, source=source, one_turn=True, picker=False)
+    assert read_route(runner, entry.session_key) is None
+    assert runner._resolve_session_agent_runtime(session_key=entry.session_key)[0] == temporary
+    assert runner.session_store.get_model_override(entry.session_key)["model"] == ASTRA
+    runner._restore_pending_one_turn_model_override(entry.session_key)
+    assert runner._resolve_session_agent_runtime(session_key=entry.session_key)[0] == ASTRA
+    assert read_route(runner, entry.session_key)["model"] == ASTRA
+    assert classifier.call_count == 1

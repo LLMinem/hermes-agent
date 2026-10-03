@@ -2169,6 +2169,9 @@ class GatewayTurnMixin:
         try:
             from gateway.session_model_route import prepare_route
             await prepare_route(self, event, source, session_entry, history, message_text)
+            if not self._is_session_run_current(_quick_key, run_generation):
+                self._hmwa_discard_stale_result(source, _quick_key, run_generation)
+                return None
             hook_ctx = {
                 "platform": source.platform.value if source.platform else "",
                 "user_id": source.user_id,
@@ -2231,12 +2234,13 @@ class GatewayTurnMixin:
                     event._notification_reply_muted = agent_result["_notification_reply_muted"]
 
             await self._hmwa_stop_typing_for_turn(event, source)
-            if agent_result.get("native_model_route_notice") and not event.internal:
-                await self._deliver_platform_notice(source, agent_result["native_model_route_notice"])
 
             if not self._is_session_run_current(_quick_key, run_generation):
                 self._hmwa_discard_stale_result(source, _quick_key, run_generation)
                 return None
+
+            if agent_result.get("native_model_route_notice") and not event.internal:
+                await self._deliver_platform_notice(source, agent_result["native_model_route_notice"])
 
             response, _intentional_silence, agent_messages = await self._hmwa_shape_agent_response(
                 agent_result, source, history, session_entry, session_key,

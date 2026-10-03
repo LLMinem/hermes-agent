@@ -6,12 +6,8 @@ failure behavior; later turns do not depend on a plugin remaining available.
 from __future__ import annotations
 
 import asyncio
-import json
 import re
-import threading
-from dataclasses import replace
 
-from gateway.config import Platform
 
 KIND = "session_model_route"
 META_KEY = "native_model_route"
@@ -30,43 +26,6 @@ def _valid_route(route):
             and all(isinstance(route.get(k), str) and _IDENTIFIER.fullmatch(route[k])
                     for k in ("model", "provider")))
 
-
-def persist_route(store, key, session_id, expected, route):
-    """CAS on the live session and manual override, publishing after a primary DB commit.
-
-    Unlike ordinary routing-index writes this never accepts a legacy JSON-only
-    fallback: an older primary row would win on restart and silently change model.
-    Callers already own the gateway turn lease.
-    """
-    if not _valid_route(route):
-        raise SessionModelRouteError()
-    with store._lock:
-        entry = store._entry_locked(key)
-        if (entry is None or entry.session_id != session_id
-                or entry.metadata.get(META_KEY) != expected
-                or (expected is None and entry.model_override is not None)):
-            return False
-        if expected is not None and entry.model_override != {
-                k: expected[k] for k in ("model", "provider")}:
-            return False
-        candidate = replace(entry, metadata={**entry.metadata, META_KEY: dict(route)},
-                            model_override={k: route[k] for k in ("model", "provider")})
-        # Use the existing index writer, but refuse its disk fallback for this
-        # contract. Requiring a healthy primary also fences subsequent restarts.
-        db = store._routing_db
-        if db is None:
-            raise SessionModelRouteError()
-        try:
-            with store._lazy("_save_lock", threading.Lock):
-                revision = store._next_routing_generation_locked()
-                encoded = json.dumps(candidate.to_dict())
-                db.save_gateway_routing_entry(key, encoded, scope=store._routing_scope())
-                store._lazy("_fast_persisted_entries", dict)[key] = (revision, encoded)
-        except Exception as exc:
-            raise SessionModelRouteError() from exc
-        entry.metadata = candidate.metadata
-        entry.model_override = candidate.model_override
-        return True
 
 
 def read_route(runner, key):
@@ -106,17 +65,27 @@ def resolve_pinned_runtime(runner, key):
     return route["model"], runtime
 
 
+def bind_agent(runner, key, agent):
+    """Bind the resolved route and disable fallback before the main agent executes."""
+    from agent.session_model_pin import SessionModelPin
+    route = read_route(runner, key)
+    agent._session_model_pin = (SessionModelPin(route["model"], route["provider"],
+        route.get("reason", "default_after_interrupted_classifier")) if route else None)
+    if route:
+        runner._apply_fallback_chain_to_agent(agent, None)
+
+
 async def prepare_route(runner, event, source, entry, history, message):
     """Run only for an eligible first human turn, with already prepared text."""
     from hermes_cli.middleware import middleware_payload
     from hermes_cli.plugins import has_middleware, invoke_middleware
 
-    if event.internal or source.platform != Platform.TELEGRAM:
+    if event.internal:
         return
     key = entry.session_key
     if read_route(runner, key) is not None:
         return
-    if not has_middleware(KIND):
+    if not has_middleware(KIND, platform=source.platform.value):
         return
     if not runner.session_store._routing_db_loaded:
         raise SessionModelRouteError()
@@ -127,7 +96,7 @@ async def prepare_route(runner, event, source, entry, history, message):
     def choose():
         model, runtime = runner._resolve_session_agent_runtime(source=source, session_key=key)
         pending = {"model": model, "provider": runtime.get("provider"), "phase": "pending"}
-        if not persist_route(runner.session_store, key, sid, None, pending):
+        if not runner.session_store.compare_and_set_model_route(key, sid, None, pending):
             return
         # Persist the default BEFORE the external call. A crash cannot retry Jev
         # or send an uncommitted Astra request after the process resumes.
@@ -146,6 +115,6 @@ async def prepare_route(runner, event, source, entry, history, message):
                 selected = {"model": proposal["model"], "provider": proposal["provider"],
                             "phase": "selected", "reason": reason}
         # A /model or /new arriving during classification wins this comparison.
-        persist_route(runner.session_store, key, sid, pending, selected)
+        runner.session_store.compare_and_set_model_route(key, sid, pending, selected)
 
     await asyncio.to_thread(choose)

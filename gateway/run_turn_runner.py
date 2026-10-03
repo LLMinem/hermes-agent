@@ -1943,12 +1943,9 @@ class TurnRunner:
         agent, reused_cached_agent = self._resolve_turn_agent(
             turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr,
         )
-        from gateway.session_model_route import read_route
+        from gateway.session_model_route import bind_agent
         from agent.session_model_pin import SessionModelPin
-        pinned = read_route(runner, ctx.session_key)
-        agent._session_model_pin = SessionModelPin(pinned["model"], pinned["provider"], pinned.get("reason", "default_after_interrupted_classifier")) if pinned else None
-        if pinned:
-            runner._apply_fallback_chain_to_agent(agent, None)
+        bind_agent(runner, ctx.session_key, agent)
         if pending_fallback_notice:
             # Reuse the in-agent one-shot notice so the pre-agent provider switch is user-visible too.
             agent._pending_fallback_notice = pending_fallback_notice

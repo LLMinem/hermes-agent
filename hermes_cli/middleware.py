@@ -27,6 +27,19 @@ VALID_MIDDLEWARE: set[str] = {
 }
 
 
+@dataclass(frozen=True)
+class PlatformMiddleware:
+    """Registration filter shared by the eligibility check and dispatch."""
+
+    callback: Callable
+    platforms: frozenset[str]
+
+    def __call__(self, **kwargs):
+        if kwargs.get("platform") in self.platforms:
+            return self.callback(**kwargs)
+        return None
+
+
 @dataclass
 class RequestMiddlewareResult:
     """Result of applying request middleware to a mutable payload."""

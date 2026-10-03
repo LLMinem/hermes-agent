@@ -1116,6 +1116,46 @@ class SessionStore(
             entry.model_override = cleaned
             entry.metadata = metadata
 
+    def compare_and_set_model_route(self, key, session_id, expected, route):
+        """CAS on the live session and manual override, publishing after a primary DB commit.
+
+        Unlike ordinary routing-index writes this never accepts a legacy JSON-only
+        fallback: an older primary row would win on restart and silently change model.
+        Callers already own the gateway turn lease.
+        """
+        from dataclasses import replace
+        from gateway.session_model_route import META_KEY, _valid_route, SessionModelRouteError
+
+        if not _valid_route(route):
+            raise SessionModelRouteError()
+        with self._lock:
+            entry = self._entry_locked(key)
+            if (entry is None or entry.session_id != session_id
+                    or entry.metadata.get(META_KEY) != expected
+                    or (expected is None and entry.model_override is not None)):
+                return False
+            if expected is not None and entry.model_override != {
+                    k: expected[k] for k in ("model", "provider")}:
+                return False
+            candidate = replace(entry, metadata={**entry.metadata, META_KEY: dict(route)},
+                                model_override={k: route[k] for k in ("model", "provider")})
+            # Use the existing index writer, but refuse its disk fallback for this
+            # contract. Requiring a healthy primary also fences subsequent restarts.
+            db = self._routing_db
+            if db is None:
+                raise SessionModelRouteError()
+            try:
+                with self._lazy("_save_lock", threading.Lock):
+                    revision = self._next_routing_generation_locked()
+                    encoded = json.dumps(candidate.to_dict())
+                    db.save_gateway_routing_entry(key, encoded, scope=self._routing_scope())
+                    self._lazy("_fast_persisted_entries", dict)[key] = (revision, encoded)
+            except Exception as exc:
+                raise SessionModelRouteError() from exc
+            entry.metadata = candidate.metadata
+            entry.model_override = candidate.model_override
+            return True
+
     def get_model_override(self, session_key: str) -> Optional[Dict[str, str]]:
         """Return the persisted /model override for *session_key*, if any."""
         with self._lock:
