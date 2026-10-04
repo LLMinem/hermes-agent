@@ -1921,6 +1921,9 @@ class TurnRunner:
             # Model/credential resolution failed before the turn began; the raw text (URLs, status
             # codes) belongs in the log, and the chat gets the commands that fix it.
             logger.warning("Model resolution failed for session %s: %s", ctx.session_key or "", exc)
+            from gateway.session_model_route import SessionModelRouteError
+            if isinstance(exc, SessionModelRouteError):
+                return {"final_response": str(exc), "failed": True, "messages": [], "api_calls": 0, "tools": []}
             from hermes_cli.auth import is_rate_limited_auth_error
             if is_rate_limited_auth_error(exc.__cause__):
                 # Quota cap with valid credentials: /login cannot help; name the reset window (#89401).
@@ -1940,6 +1943,9 @@ class TurnRunner:
         agent, reused_cached_agent = self._resolve_turn_agent(
             turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr,
         )
+        from gateway.session_model_route import bind_agent
+        from agent.session_model_pin import SessionModelPin
+        bind_agent(runner, ctx.session_key, agent)
         if pending_fallback_notice:
             # Reuse the in-agent one-shot notice so the pre-agent provider switch is user-visible too.
             agent._pending_fallback_notice = pending_fallback_notice
@@ -1947,6 +1953,8 @@ class TurnRunner:
         agent_history, observed_group_context, history_media_paths = self._load_turn_history(agent, reused_cached_agent)
         persist_msg, persist_ts = self._prepare_turn_message(agent_history)
         result = self._run_conversation_with_approval(agent, agent_history, observed_group_context, persist_msg, persist_ts)
+        if isinstance(getattr(agent, "_session_model_pin", None), SessionModelPin):
+            result["native_model_route_notice"] = agent._session_model_pin.receipt()
         self._finish_stream_consumer(result, agent_history, stream_consumer)
         # The streaming-TTS consumer's finish() runs on the outer loop thread after the executor
         # returns, so early run_sync returns are also finalised.
@@ -1974,6 +1982,7 @@ class TurnRunner:
             "partial": result.get("partial", False), "completed": result.get("completed"),
             "interrupted": result.get("interrupted", False), "interrupt_message": result.get("interrupt_message"),
             "error": result.get("error"),
+            "native_model_route_notice": result.get("native_model_route_notice"),
             "compression_exhausted": result.get("compression_exhausted", False),
             "compression_deferred": result.get("compression_deferred", False),
             "tools": ctx.tools_holder[0] or [],

@@ -23,7 +23,21 @@ LLM_EXECUTION_MIDDLEWARE = "llm_execution"
 
 VALID_MIDDLEWARE: set[str] = {
     TOOL_REQUEST_MIDDLEWARE, TOOL_EXECUTION_MIDDLEWARE, LLM_REQUEST_MIDDLEWARE, LLM_EXECUTION_MIDDLEWARE,
+    "session_model_route",
 }
+
+
+@dataclass(frozen=True)
+class PlatformMiddleware:
+    """Registration filter shared by the eligibility check and dispatch."""
+
+    callback: Callable
+    platforms: frozenset[str]
+
+    def __call__(self, **kwargs):
+        if kwargs.get("platform") in self.platforms:
+            return self.callback(**kwargs)
+        return None
 
 
 @dataclass

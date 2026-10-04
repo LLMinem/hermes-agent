@@ -584,9 +584,11 @@ class PluginDispatchMixin:
             return None
         return text
 
-    def has_middleware(self, kind: str) -> bool:
-        """Return True when at least one callback is registered for middleware."""
-        return bool(self._middleware.get(kind))
+    def has_middleware(self, kind: str, *, platform: Optional[str] = None) -> bool:
+        """Check registration, optionally for a specific platform before reserving a route."""
+        from hermes_cli.middleware import PlatformMiddleware
+        return any(platform is None or not isinstance(cb, PlatformMiddleware) or platform in cb.platforms
+                   for cb in self._middleware.get(kind, []))
 
     def invoke_middleware(self, kind: str, **kwargs: Any) -> List[Any]:
         """Call middleware callbacks for *kind* (each isolated); return non-``None`` results."""

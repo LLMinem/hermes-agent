@@ -92,6 +92,10 @@ def perform_api_call(
                 next_api_kwargs, allow_stream=False, is_github_responses=agent._is_copilot_url(),
                 sanitize_harmony_tokens=agent._is_codex_backend(),
             )
+        from agent.session_model_pin import SessionModelPin
+        pin = getattr(agent, "_session_model_pin", None)
+        if isinstance(pin, SessionModelPin):
+            pin.before_request(agent, next_api_kwargs)
         if _use_streaming:
             return agent._interruptible_streaming_api_call(
                 next_api_kwargs, on_first_delta=_stop_spinner
@@ -145,6 +149,10 @@ def perform_api_call(
                 bool(agent._pending_redirect) if _redirect_lock is not None
                 else agent._has_pending_redirect()
             )
+    from agent.session_model_pin import SessionModelPin
+    pin = getattr(agent, "_session_model_pin", None)
+    if isinstance(pin, SessionModelPin):
+        pin.after_response(response)
     if _redirect_crossed_response:
         # Response and redirect can cross threads: discard the now-stale
         # response and rebuild from the correction rather than lose it.

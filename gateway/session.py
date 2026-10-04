@@ -1104,15 +1104,57 @@ class SessionStore(
 
         with self._lock:
             entry = self._entry_locked(session_key)
-            if entry is None or entry.model_override == cleaned:
+            if entry is None or (entry.model_override == cleaned and "native_model_route" not in entry.metadata):
                 return
             # Publish only after persistence so a failed clear remains retryable.
             data, generation = self._snapshot_routing_locked()
             # Snapshot reconciliation may replace the entry after database recovery.
             entry = self._entries[session_key]
-            data[session_key] = replace(entry, model_override=cleaned).to_dict()
+            metadata = {k: v for k, v in entry.metadata.items() if k != "native_model_route"}
+            data[session_key] = replace(entry, model_override=cleaned, metadata=metadata).to_dict()
             self._persist_routing_data(data, generation)
             entry.model_override = cleaned
+            entry.metadata = metadata
+
+    def compare_and_set_model_route(self, key, session_id, expected, route):
+        """CAS on the live session and manual override, publishing after a primary DB commit.
+
+        Unlike ordinary routing-index writes this never accepts a legacy JSON-only
+        fallback: an older primary row would win on restart and silently change model.
+        Callers already own the gateway turn lease.
+        """
+        from dataclasses import replace
+        from gateway.session_model_route import META_KEY, _valid_route, SessionModelRouteError
+
+        if not _valid_route(route):
+            raise SessionModelRouteError()
+        with self._lock:
+            entry = self._entry_locked(key)
+            if (entry is None or entry.session_id != session_id
+                    or entry.metadata.get(META_KEY) != expected
+                    or (expected is None and entry.model_override is not None)):
+                return False
+            if expected is not None and entry.model_override != {
+                    k: expected[k] for k in ("model", "provider")}:
+                return False
+            candidate = replace(entry, metadata={**entry.metadata, META_KEY: dict(route)},
+                                model_override={k: route[k] for k in ("model", "provider")})
+            # Use the existing index writer, but refuse its disk fallback for this
+            # contract. Requiring a healthy primary also fences subsequent restarts.
+            db = self._routing_db
+            if db is None:
+                raise SessionModelRouteError()
+            try:
+                with self._lazy("_save_lock", threading.Lock):
+                    revision = self._next_routing_generation_locked()
+                    encoded = json.dumps(candidate.to_dict())
+                    db.save_gateway_routing_entry(key, encoded, scope=self._routing_scope())
+                    self._lazy("_fast_persisted_entries", dict)[key] = (revision, encoded)
+            except Exception as exc:
+                raise SessionModelRouteError() from exc
+            entry.metadata = candidate.metadata
+            entry.model_override = candidate.model_override
+            return True
 
     def get_model_override(self, session_key: str) -> Optional[Dict[str, str]]:
         """Return the persisted /model override for *session_key*, if any."""
@@ -1260,6 +1302,8 @@ class SessionStore(
             new_entry = self._replace_route_locked(
                 session_key, old_entry, target_session_id, _now(),
                 display_name=old_entry.display_name, model_override=old_entry.model_override,
+                metadata=({"native_model_route": dict(old_entry.metadata["native_model_route"])}
+                          if "native_model_route" in old_entry.metadata else {}),
                 prompt_pin=(
                     dict(old_entry.prompt_pin)
                     if preserve_prompt_pin and old_entry.prompt_pin is not None else None

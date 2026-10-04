@@ -26,7 +26,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from functools import cached_property, wraps
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Set, Tuple, Union
 
 from hermes_constants import get_hermes_home, get_process_hermes_home, hermes_home_key
 from registration_lifecycle import replacement_coordinator
@@ -975,9 +975,21 @@ class PluginContext:
         """Register a lifecycle hook callback (unknown names warn but are still stored)."""
         return self._track_callback("hook", hook_name, callback, self._manager._hooks, VALID_HOOKS)
 
-    def register_middleware(self, kind: str, callback: Callable) -> PluginRegistration:
-        """Register behavior-changing middleware (request kinds rewrite the payload, execution kinds
-        wrap the callback). Unknown kinds warn but are stored."""
+    def register_middleware(
+        self, kind: str, callback: Callable, *, require_supported: bool = False,
+        platforms: Optional[Iterable[str]] = None,
+    ) -> PluginRegistration:
+        """Register middleware; optionally reject unknown kinds and limit platform applicability."""
+        if require_supported and kind not in VALID_MIDDLEWARE:
+            raise ValueError(f"Unsupported middleware: {kind}")
+        if platforms is not None:
+            from hermes_cli.middleware import PlatformMiddleware
+            if isinstance(platforms, str):
+                raise ValueError("platforms must be a collection of platform names")
+            names = frozenset(platforms)
+            if not names or not all(isinstance(name, str) and name for name in names):
+                raise ValueError("platforms must contain nonempty platform names")
+            callback = PlatformMiddleware(callback, names)
         return self._track_callback(
             "middleware", kind, callback, self._manager._middleware, VALID_MIDDLEWARE
         )
@@ -1962,7 +1974,7 @@ def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
     return _delivery_manager().invoke_middleware(kind, **kwargs)
 
 
-def has_middleware(kind: str) -> bool:
+def has_middleware(kind: str, *, platform: Optional[str] = None) -> bool:
     """True when middleware is registered for ``kind``; lazy-discovers first since callers gate
     :func:`invoke_middleware` on it.
 
@@ -1972,7 +1984,7 @@ def has_middleware(kind: str) -> bool:
     manager = _delivery_manager()
     method = getattr(manager, "has_middleware", None)
     if callable(method):
-        return bool(method(kind))
+        return bool(method(kind)) if platform is None else bool(method(kind, platform=platform))
     return bool(getattr(manager, "_middleware", {}).get(kind))
 
 
